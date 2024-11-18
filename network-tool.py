@@ -3,6 +3,9 @@ import paramiko
 import logging
 import time
 import re
+from datetime import datetime, timedelta
+import pytz
+import sched
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -23,6 +26,15 @@ def get_commands():
             break
         commands.append(command)
     return commands
+
+def get_schedule_option():
+    option = input("Do you want to schedule the config push? (yes/no): ").strip().lower()
+    if option == 'yes':
+        date_str = input("Enter date and time in EST (YYYY-MM-DD HH:MM:SS): ").strip()
+        est = pytz.timezone('US/Eastern')
+        scheduled_time = est.localize(datetime.strptime(date_str, "%Y-%m-%d %H:%M:%S"))
+        return scheduled_time
+    return None
 
 def identify_device_type(shell):
     """Identify the network device type and model."""
@@ -91,9 +103,7 @@ def execute_commands(shell, commands, device_type):
                 break
     return output_data
 
-def main():
-    hostname_list, username, password = get_user_input()
-    commands = get_commands()
+def config_push(hostname_list, username, password, commands):
     for hostname in hostname_list:
         hostname = hostname.strip()
         try:
@@ -119,6 +129,21 @@ def main():
             logging.info("Disconnected from %s", hostname)
         except Exception as e:
             logging.error("An error occurred with %s: %s", hostname, str(e))
+
+def main():
+    hostname_list, username, password = get_user_input()
+    commands = get_commands()
+    scheduled_time = get_schedule_option()
+
+    if scheduled_time:
+        now = datetime.now(pytz.timezone('US/Eastern'))
+        delay = (scheduled_time - now).total_seconds()
+        scheduler = sched.scheduler(time.time, time.sleep)
+        scheduler.enter(delay, 1, config_push, (hostname_list, username, password, commands))
+        logging.info("Scheduled config push at %s", scheduled_time)
+        scheduler.run()
+    else:
+        config_push(hostname_list, username, password, commands)
 
 if __name__ == "__main__":
     main()
