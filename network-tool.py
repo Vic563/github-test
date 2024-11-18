@@ -20,16 +20,21 @@ def get_user_input():
 def get_commands():
     print("Enter commands to execute. Press Enter twice when finished:")
     commands = []
+    empty_line_count = 0
     while True:
         command = input()
-        if command.lower() == 'done':
-            break
-        commands.append(command)
+        if command == '':
+            empty_line_count += 1
+            if empty_line_count == 2:
+                break
+        else:
+            empty_line_count = 0
+            commands.append(command)
     return commands
 
 def get_schedule_option():
     option = input("Do you want to schedule the config push? (yes/no): ").strip().lower()
-    if option == 'yes':
+    if option in ['yes', 'y']:
         date_str = input("Enter date and time in EST (YYYY-MM-DD HH:MM:SS): ").strip()
         est = pytz.timezone('US/Eastern')
         scheduled_time = est.localize(datetime.strptime(date_str, "%Y-%m-%d %H:%M:%S"))
