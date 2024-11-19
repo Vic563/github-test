@@ -6,6 +6,8 @@ import re
 from datetime import datetime, timedelta
 import pytz
 import sched
+import difflib
+from collections import defaultdict
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -62,6 +64,21 @@ def get_commands():
             break
         commands.append(command)
     return commands
+
+def get_all_commands():
+    """Get config, pre-check, and post-check commands separately."""
+    print("Enter configuration commands to execute. Press Enter twice when finished:")
+    config_commands = get_commands()
+    
+    print("\nEnter pre-check commands. Press Enter twice when finished:")
+    pre_check_commands = get_commands()
+    
+    print("\nEnter post-check commands (or press Enter to use the same as pre-check):")
+    post_check_commands = get_commands()
+    if not post_check_commands:
+        post_check_commands = pre_check_commands
+    
+    return config_commands, pre_check_commands, post_check_commands
 
 def get_schedule_option():
     option = input("Do you want to schedule the config push? (yes/no): ").strip().lower()
@@ -227,48 +244,143 @@ def perform_pre_post_checks(hostname_list, username, password, commands, check_t
         except Exception as e:
             logging.error("An error occurred with %s: %s", hostname, str(e))
 
-def config_push(hostname_list, username, password, commands):
+def compare_outputs(pre_output, post_output, hostname):
+    """Compare pre and post check outputs and generate detailed diff."""
+    def clean_output(output):
+        # Remove timestamp variations and other volatile data
+        lines = output.splitlines()
+        cleaned = []
+        for line in lines:
+            # Skip empty lines and lines with just whitespace
+            if not line.strip():
+                continue
+            # Remove timestamp patterns
+            line = re.sub(r'\d{2}:\d{2}:\d{2}\.\d+', 'XX:XX:XX.XXX', line)
+            line = re.sub(r'\d{2}:\d{2}:\d{2}', 'XX:XX:XX', line)
+            cleaned.append(line)
+        return cleaned
+
+    pre_lines = clean_output(pre_output)
+    post_lines = clean_output(post_output)
+    
+    # Generate diff
+    differ = difflib.Differ()
+    diff = list(differ.compare(pre_lines, post_lines))
+    
+    # Process and categorize differences
+    changes = {
+        'added': [],
+        'removed': [],
+        'changed': []
+    }
+    
+    for line in diff:
+        if line.startswith('+ '):
+            changes['added'].append(line[2:])
+        elif line.startswith('- '):
+            changes['removed'].append(line[2:])
+        elif line.startswith('? '):
+            continue
+        else:
+            changes['changed'].append(line[2:])
+
+    # Generate the report
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    report_filename = f"{hostname}_diff_report_{timestamp}.txt"
+    
+    with open(report_filename, 'w') as f:
+        f.write(f"Change Report for {hostname}\n")
+        f.write("=" * 80 + "\n\n")
+        
+        f.write("Added Configurations:\n")
+        f.write("-" * 40 + "\n")
+        for line in changes['added']:
+            f.write(f"+ {line}\n")
+        f.write("\n")
+        
+        f.write("Removed Configurations:\n")
+        f.write("-" * 40 + "\n")
+        for line in changes['removed']:
+            f.write(f"- {line}\n")
+        f.write("\n")
+        
+        # Generate detailed diff using unified diff format
+        f.write("Detailed Diff:\n")
+        f.write("-" * 40 + "\n")
+        unified_diff = difflib.unified_diff(pre_lines, post_lines, 
+                                         fromfile='Pre-Check', 
+                                         tofile='Post-Check',
+                                         lineterm='')
+        f.write('\n'.join(unified_diff))
+        
+    return report_filename
+
+def config_push(hostname_list, username, password, config_commands, pre_commands, post_commands):
+    results = defaultdict(dict)
+    
     for hostname in hostname_list:
         hostname = hostname.strip()
         try:
-            logging.info("Connecting to %s", hostname)
+            # Connect and get device type
             client = paramiko.SSHClient()
             client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-            client.connect(hostname, username=username, password=password, allow_agent=False, look_for_keys=False)
-            logging.info("Connected to %s", hostname)
-
+            client.connect(hostname, username=username, password=password, 
+                         allow_agent=False, look_for_keys=False)
+            
             shell = client.invoke_shell()
             time.sleep(1)
-
             device_type = identify_device_type(shell)
-            logging.info(f"Detected device type: {device_type}")
-
-            output = execute_commands(shell, commands, device_type)
-            print(f"Output from {hostname} ({device_type}):\n{output}")
-
+            logging.info(f"Connected to {hostname} ({device_type})")
+            
+            # Perform pre-checks
+            logging.info(f"Performing pre-checks on {hostname}")
+            results[hostname]['pre_check'] = execute_commands(shell, pre_commands, device_type)
+            
+            # Perform config push
+            logging.info(f"Pushing configuration to {hostname}")
+            results[hostname]['config'] = execute_commands(shell, config_commands, device_type)
+            
+            # Perform post-checks
+            logging.info(f"Performing post-checks on {hostname}")
+            results[hostname]['post_check'] = execute_commands(shell, post_commands, device_type)
+            
+            # Compare and generate diff report
+            report_file = compare_outputs(results[hostname]['pre_check'],
+                                       results[hostname]['post_check'],
+                                       hostname)
+            
+            logging.info(f"Diff report generated: {report_file}")
+            print(f"\nDiff report for {hostname} has been saved to: {report_file}")
+            
             shell.close()
             client.close()
-            logging.info("Disconnected from %s", hostname)
+            
         except Exception as e:
-            logging.error("An error occurred with %s: %s", hostname, str(e))
+            logging.error(f"An error occurred with {hostname}: {str(e)}")
+            results[hostname]['error'] = str(e)
+
+    return results
 
 def main():
     hostname_list, username, password = get_user_input()
     option = input("Select an option:\n1. Config Push\n2. Pre-checks\n3. Post-checks\nEnter your choice: ").strip()
     
     if option == '1':
-        commands = get_commands()
+        config_commands, pre_commands, post_commands = get_all_commands()
         scheduled_time = get_schedule_option()
 
         if scheduled_time:
             now = datetime.now(pytz.timezone('US/Eastern'))
             delay = (scheduled_time - now).total_seconds()
             scheduler = sched.scheduler(time.time, time.sleep)
-            scheduler.enter(delay, 1, config_push, (hostname_list, username, password, commands))
-            logging.info("Scheduled config push at %s", scheduled_time)
+            scheduler.enter(delay, 1, config_push, 
+                          (hostname_list, username, password, config_commands, 
+                           pre_commands, post_commands))
+            logging.info(f"Scheduled config push at {scheduled_time}")
             scheduler.run()
         else:
-            config_push(hostname_list, username, password, commands)
+            config_push(hostname_list, username, password, config_commands, 
+                       pre_commands, post_commands)
     elif option == '2':
         commands = get_commands()
         perform_pre_post_checks(hostname_list, username, password, commands, "pre-check")
