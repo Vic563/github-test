@@ -18,18 +18,13 @@ def get_user_input():
     return hostname_list, username, password
 
 def get_commands():
-    print("Enter commands to execute. Press Enter twice when finished:")
+    print("Enter commands to execute. Press Enter once when finished:")
     commands = []
-    empty_line_count = 0
     while True:
         command = input()
         if command == '':
-            empty_line_count += 1
-            if empty_line_count == 2:
-                break
-        else:
-            empty_line_count = 0
-            commands.append(command)
+            break
+        commands.append(command)
     return commands
 
 def get_schedule_option():
@@ -45,35 +40,57 @@ def identify_device_type(shell):
     """Identify the network device type and model."""
     shell.settimeout(2)
     
-    # Test for Juniper
+    # Test for Juniper devices
     shell.send('set cli screen-length 0\n')
     time.sleep(1)
-    output = shell.recv(1024).decode('utf-8')
+    output = shell.recv(1024).decode('utf-8', errors='ignore')
     
     if 'syntax error' not in output.lower():
         # It's a Juniper device
         shell.send('show version\n')
         time.sleep(2)
-        version_output = shell.recv(2048).decode('utf-8')
+        version_output = ''
+        while True:
+            try:
+                recv_data = shell.recv(2048).decode('utf-8', errors='ignore')
+                if not recv_data:
+                    break
+                version_output += recv_data
+            except Exception:
+                break
         
-        # Parse Juniper model from show version
-        if 'mx' in version_output.lower():
-            return 'juniper-mx'
-        elif 'ex' in version_output.lower():
-            return 'juniper-ex'
-        elif 'srx' in version_output.lower():
-            return 'juniper-srx'
-        return 'juniper-unknown'
+        # Parse the model from the show version output
+        match = re.search(r'^Model:\s*(\S+)', version_output, re.MULTILINE)
+        if match:
+            model = match.group(1).lower()
+            if 'mx' in model:
+                return 'juniper-mx'
+            elif 'ex' in model:
+                return 'juniper-ex'
+            elif 'srx' in model:
+                return 'juniper-srx'
+            else:
+                return 'juniper-unknown'
+        else:
+            return 'juniper-unknown'
     
-    # Test for Cisco/Arista
+    # Test for Cisco/Arista devices
     shell.send('terminal length 0\n')
     time.sleep(1)
-    output = shell.recv(1024).decode('utf-8')
+    output = shell.recv(1024).decode('utf-8', errors='ignore')
     
     if 'syntax error' not in output.lower():
         shell.send('show version\n')
         time.sleep(2)
-        version_output = shell.recv(2048).decode('utf-8')
+        version_output = ''
+        while True:
+            try:
+                recv_data = shell.recv(2048).decode('utf-8', errors='ignore')
+                if not recv_data:
+                    break
+                version_output += recv_data
+            except Exception:
+                break
         
         if re.search(r'cisco', version_output, re.IGNORECASE):
             return 'cisco'
@@ -100,13 +117,47 @@ def execute_commands(shell, commands, device_type):
         time.sleep(1)
         while True:
             try:
-                recv_data = shell.recv(1024).decode('utf-8')
+                recv_data = shell.recv(1024).decode('utf-8', errors='ignore')
                 if not recv_data:
                     break
                 output_data += recv_data
             except Exception:
                 break
     return output_data
+
+def perform_pre_post_checks(hostname_list, username, password, commands, check_type):
+    for hostname in hostname_list:
+        hostname = hostname.strip()
+        try:
+            logging.info("Connecting to %s for %s checks", hostname, check_type)
+            client = paramiko.SSHClient()
+            client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+            client.connect(hostname, username=username, password=password, allow_agent=False, look_for_keys=False)
+            logging.info("Connected to %s", hostname)
+
+            # Open an interactive shell
+            shell = client.invoke_shell()
+            time.sleep(1)
+
+            device_type = identify_device_type(shell)
+            logging.info(f"Detected device type: {device_type}")
+
+            # Execute commands
+            output = execute_commands(shell, commands, device_type)
+            save_option = input(f"Do you want to save the {check_type} check output to a file? (yes/no): ").strip().lower()
+            if save_option in ['yes', 'y']:
+                file_path = input("Enter the file path to save the output: ").strip()
+                with open(file_path, 'w') as file:
+                    file.write(f"Output from {hostname} ({device_type}):\n{output}\n")
+                logging.info(f"Output saved to {file_path}")
+            else:
+                print(f"Output from {hostname} ({device_type}):\n{output}")
+
+            shell.close()
+            client.close()
+            logging.info("Disconnected from %s", hostname)
+        except Exception as e:
+            logging.error("An error occurred with %s: %s", hostname, str(e))
 
 def config_push(hostname_list, username, password, commands):
     for hostname in hostname_list:
@@ -137,18 +188,29 @@ def config_push(hostname_list, username, password, commands):
 
 def main():
     hostname_list, username, password = get_user_input()
-    commands = get_commands()
-    scheduled_time = get_schedule_option()
+    option = input("Select an option:\n1. Config Push\n2. Pre-checks\n3. Post-checks\nEnter your choice: ").strip()
+    
+    if option == '1':
+        commands = get_commands()
+        scheduled_time = get_schedule_option()
 
-    if scheduled_time:
-        now = datetime.now(pytz.timezone('US/Eastern'))
-        delay = (scheduled_time - now).total_seconds()
-        scheduler = sched.scheduler(time.time, time.sleep)
-        scheduler.enter(delay, 1, config_push, (hostname_list, username, password, commands))
-        logging.info("Scheduled config push at %s", scheduled_time)
-        scheduler.run()
+        if scheduled_time:
+            now = datetime.now(pytz.timezone('US/Eastern'))
+            delay = (scheduled_time - now).total_seconds()
+            scheduler = sched.scheduler(time.time, time.sleep)
+            scheduler.enter(delay, 1, config_push, (hostname_list, username, password, commands))
+            logging.info("Scheduled config push at %s", scheduled_time)
+            scheduler.run()
+        else:
+            config_push(hostname_list, username, password, commands)
+    elif option == '2':
+        commands = get_commands()
+        perform_pre_post_checks(hostname_list, username, password, commands, "pre-check")
+    elif option == '3':
+        commands = get_commands()
+        perform_pre_post_checks(hostname_list, username, password, commands, "post-check")
     else:
-        config_push(hostname_list, username, password, commands)
+        logging.error("Invalid option selected. Exiting.")
 
 if __name__ == "__main__":
     main()
